@@ -1,0 +1,3 @@
+# 运行时零第三方依赖（仅标准库 + tkinter），本文件只用于开发/构建
+pyinstaller>=6.0      # 打包 exe
+pillow>=9.4           # tools/make_icon.py 生成图标用

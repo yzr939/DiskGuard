@@ -1,0 +1,9 @@
+# 统一行尾: 文本文件入库一律 LF, 二进制文件不做换行转换。
+# 目的: 避免 Windows 下 core.autocrlf 造成的"幽灵改动"
+# (工作区与仓库内容一致, git status 却显示一批 M)。
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.exe binary
+*.db binary
+*.zip binary

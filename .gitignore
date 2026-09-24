@@ -1,0 +1,36 @@
+# ===== Python 运行时产物 =====
+__pycache__/
+*.py[cod]
+
+# ===== 打包构建产物与中间目录 =====
+build/
+build_conda/
+dist/
+dist_diag/
+*.old.exe
+DiskGuard.spec
+
+# ===== 打包用隔离 venv =====
+.venv-build/
+
+# ===== 运行期数据库（含 WAL / SHM）=====
+*.db
+*.db-shm
+*.db-wal
+
+# ===== 本地回退快照与临时脚本 =====
+*.bak-*
+_qa_*
+_tmp_*
+
+# ===== 构建日志与临时状态 =====
+build_log.txt
+build_diag_log*.txt
+tmp_state.txt
+selftest_before.txt
+
+# ===== 编辑器 / 系统杂项 =====
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
