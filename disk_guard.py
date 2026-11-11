@@ -31,9 +31,11 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from tkinter.font import Font
+from xml.sax.saxutils import escape as xml_escape
 
 
 # ---------------- 路径与常量 ----------------
@@ -662,6 +664,7 @@ class Store:
         self.path = path or resolve_db_path()
         self._lock = threading.RLock()
         self.write_time = 0.0
+        self.write_failures = 0          # 写库失败累计(行数), 扫描结束在状态栏可见
         self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -732,13 +735,18 @@ class Store:
 
     # ---- 读写 ----
     def upsert_many(self, rows):
+        """批量写库。失败不再静默: 失败行数计入 write_failures, 供界面露出。"""
         t0 = time.perf_counter()
         with self._lock:
             try:
                 self._conn.executemany(_UPSERT, rows)
                 self._conn.commit()
             except sqlite3.Error:
-                self._conn.rollback()
+                self.write_failures += len(rows)
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:       # 连接已死等场景, 回滚本身也会抛
+                    pass
         self.write_time += time.perf_counter() - t0
 
     def purge_stale(self, parents, seq):
@@ -750,7 +758,11 @@ class Store:
                     "DELETE FROM folders WHERE parent=? AND seq<>?", [(p, seq) for p in parents])
                 self._conn.commit()
             except sqlite3.Error:
-                self._conn.rollback()
+                self.write_failures += len(parents)
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
         self.write_time += time.perf_counter() - t0
 
     def touch(self, path, seq, ts=None):
@@ -1050,6 +1062,84 @@ def pick_ui_family():
         if fam in avail:
             return fam
     return None
+
+
+# ---------------- 导出 Excel(xlsx) ----------------
+# xlsx 本质是"ZIP + 一组 XML"的开放格式, 用标准库 zipfile 手写最小部件集即可,
+# 不引第三方依赖。字符串用 inlineStr 内联(免掉 sharedStrings 部件), 表头加粗走 styles.xml。
+# 只包含 Excel 必需的 6 个部件:
+#   [Content_Types].xml / _rels/.rels / xl/workbook.xml
+#   / xl/_rels/workbook.xml.rels / xl/styles.xml / xl/worksheets/sheet1.xml
+
+_CT_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>"""
+
+_RELS_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"""
+
+_WORKBOOK_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="{name}" sheetId="1" r:id="rId1"/></sheets></workbook>"""
+
+_WB_RELS_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"""
+
+_STYLES_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="2"><xf/><xf fontId="1" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"""
+
+
+def _xml_text(v):
+    """单元格文本净化: 先去掉 XML 1.0 不允许的控制字符, 再做实体转义。"""
+    if v is None:
+        return ""
+    s = "".join(ch for ch in str(v) if ch >= " " or ch in "\t\n\r")
+    return xml_escape(s)
+
+
+def _col_letter(n):
+    """0 -> A, 25 -> Z, 26 -> AA (Excel 列号)。"""
+    s = ""
+    n += 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def write_xlsx(path, header, rows, sheet_name="DiskGuard"):
+    """把表格写成 .xlsx(最小部件集, 零第三方依赖)。返回数据行数。
+
+    header: [str, ...]; rows: [[str|int|float|None, ...], ...]。
+    数字以数值类型写入(Excel 里可直接排序/求和), None 与 "" 写成空单元格;
+    全空行整体省略(Excel 允许缺行)。
+    """
+    # 工作表名: Excel 禁止 :\\/?*[] 且上限 31 字符
+    sheet_name = "".join(c for c in (sheet_name or "")
+                         if c not in ":\\/?*[]")[:31] or "DiskGuard"
+    lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+             '<sheetData>']
+    for ri, row in enumerate([header] + list(rows), start=1):
+        cells = []
+        for ci, v in enumerate(row):
+            if v is None or v == "":
+                continue
+            ref = f"{_col_letter(ci)}{ri}"
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                cells.append(f'<c r="{ref}"><v>{v}</v></c>')
+            else:
+                cells.append(f'<c r="{ref}" t="inlineStr"><is>'
+                             f'<t xml:space="preserve">{_xml_text(v)}</t></is></c>')
+        if cells:
+            lines.append(f'<row r="{ri}">' + "".join(cells) + "</row>")
+    lines.append("</sheetData></worksheet>")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", _CT_XML)
+        z.writestr("_rels/.rels", _RELS_XML)
+        z.writestr("xl/workbook.xml", _WORKBOOK_XML.format(name=xml_escape(sheet_name)))
+        z.writestr("xl/_rels/workbook.xml.rels", _WB_RELS_XML)
+        z.writestr("xl/styles.xml", _STYLES_XML)
+        z.writestr("xl/worksheets/sheet1.xml", "\n".join(lines))
+    return len(rows)
 
 
 # ---------------- 删除到回收站 ----------------
@@ -1670,6 +1760,10 @@ class DiskGuardApp:
         # 危险按钮用纯文字: "🗑" 在红色前景下会渲染成一坨红色实心块, 很脏
         ttk.Button(r1, text="删除到回收站", style="Danger.TButton",
                    command=self.delete_selected).pack(side="left")
+        exp_btn = ttk.Button(r1, text="导出 Excel", command=self.export_view)
+        exp_btn.pack(side="left", padx=(10, 0))
+        self._tip(exp_btn, "把当前视图(含筛选/锚点后的所见行)导出为 .xlsx 文件; "
+                           "大小/变化为字节数值列, 可在 Excel 里直接排序求和")
         pillbox = ttk.Frame(r1)
         pillbox.pack(side="right")
         ttk.Label(pillbox, text="筛选").pack(side="left", padx=(0, 6))
@@ -2307,6 +2401,7 @@ class DiskGuardApp:
         self.progress_var.set(0.0)          # 进度条归零并显示
         self._show_progress()
         self.store.write_time = 0.0
+        self.store.write_failures = 0
 
         self.scan_thread = threading.Thread(
             target=self._scan_worker, args=(target, self.skip_var.get()),
@@ -2367,6 +2462,8 @@ class DiskGuardApp:
     def _finish_scan(self, text):
         self.scan_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        if getattr(self.store, "write_failures", 0):
+            text += f" | ⚠ 写库失败 {self.store.write_failures} 条(数据不完整, 建议重扫)"
         self._set_status(text)
         self._refresh_db_info()
         self._refresh_asof_values()          # 新扫完一个批次, 候选时间变了
@@ -2542,6 +2639,47 @@ class DiskGuardApp:
             return
         self.path_var.set(row["path"])
         self.start_scan()
+
+    def export_view(self):
+        """把当前视图导出为 .xlsx(所见即所得: 筛选/锚点/合并之后的 _rows 原样导出)。
+
+        大小/基准/变化写成数值列(字节), 变化率写成数值列(%), Excel 里可直接排序求和。
+        """
+        if not self._rows:
+            self._set_status("当前视图没有可导出的行")
+            return
+        target = os.path.normpath(self.scanned_target or self.path_var.get() or "")
+        base_name = "".join(c for c in os.path.basename(target)
+                            if c not in '\\/:*?"<>|') or "view"
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="导出当前视图",
+            defaultextension=".xlsx",
+            initialfile=f"DiskGuard_{datetime.date.today():%Y%m%d}_{base_name}.xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx"), ("所有文件", "*.*")])
+        if not path:
+            return
+        header = ["星标", "文件夹", "完整路径", "大小(字节)", "基准(字节)", "基准日期",
+                  "变化(字节)", "变化率(%)", "走势", "状态", "扫描时间"]
+        rows = [[("★" if r["starred"] else ""),
+                 r["name"],
+                 r["path"] or "",
+                 r["size"],
+                 r["prev"],
+                 r.get("prev_ts") or "",
+                 r["delta"],
+                 round(r["pct"], 2) if r["pct"] is not None else None,
+                 r["spark"],
+                 r["status"],
+                 r["ts"] if r["ts"] != "—" else ""]
+                for r in self._rows]
+        try:
+            n = write_xlsx(path, header, rows,
+                           sheet_name=base_name if base_name != "view" else "DiskGuard")
+        except Exception as e:          # 窗口回调必须捕获并可见化, 绝不静默(README 开发约定)
+            messagebox.showerror("导出失败", f"{e}\n\n{path}")
+            self._set_status(f"导出失败: {e}")
+            return
+        self._set_status(f"已导出 {n} 行到 {path}")
 
     def delete_selected(self):
         row = self._selected_row()
@@ -2874,6 +3012,36 @@ def _selftest_body():
     assert not DiskGuardApp._is_alert(1024 ** 2, 1024 ** 2 + 10 * 1024, 500, 10)
     assert not DiskGuardApp._is_alert(0, 100, 500, 10)
     assert len(list_fixed_drives()) >= 1
+
+    # --- 导出 xlsx(标准库手写): ZIP 完整性 + 部件齐全 + 内容回读 + XML 转义 ---
+    xlsx_path = os.path.join(work, "out.xlsx")
+    n_x = write_xlsx(xlsx_path, ["文件夹", "大小(字节)"],
+                     [["alpha", 123], ["中文 & <特殊> 目录", 456]])
+    assert n_x == 2, n_x
+    with zipfile.ZipFile(xlsx_path) as z:
+        assert z.testzip() is None
+        names = set(z.namelist())
+        assert {"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml",
+                "xl/_rels/workbook.xml.rels", "xl/styles.xml",
+                "xl/worksheets/sheet1.xml"} <= names, names
+        sheet_xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert "&amp;" in sheet_xml and "&lt;" in sheet_xml       # 特殊字符已转义
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(sheet_xml)
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    assert len(root.findall(f"{ns}sheetData/{ns}row")) == 3       # 表头 + 2 数据行
+    texts = [t.text for t in root.iter(f"{ns}t")]
+    assert "文件夹" in texts and "alpha" in texts and "中文 & <特殊> 目录" in texts
+    nums = [v.text for v in root.iter(f"{ns}v")]
+    assert "123" in nums and "456" in nums, nums
+
+    # --- 写库失败可见化: 连接已死时写库, 失败计入 write_failures 而非静默 ---
+    fs = Store(os.path.join(work, "fail.db"))
+    fs._conn.close()                    # 模拟写库故障(连接已死, rollback 也会抛)
+    fs.upsert_many([upsert_row(os.path.join(work, "failrow"), 1,
+                               now_str(), None, False, False, 0)])
+    assert fs.write_failures == 1, fs.write_failures
+    fs.close()
 
     # --- 临时解包残留清理(只动自己、不动别人、不动正在用的) ---
     fake_home = tempfile.mkdtemp(prefix="dg_tmpclean_")
