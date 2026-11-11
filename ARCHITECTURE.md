@@ -4,7 +4,7 @@
 >
 > 对象：`disk_guard.py` —— 单文件 Python 3.11 + Tkinter 实现的 Windows 磁盘空间监控小工具，当前发布版本 **1.0.0**。
 >
-> 本文只描述**现状与设计权衡**，**不依赖具体行号**（行号随代码演进立即过期），请用**函数名 / 类名 + 语义**作索引（见附录 A）。界面截图见 `docs/screenshot-main.png`、`docs/screenshot-minsize.png`、`docs/screenshot-filter-anchor.png`。
+> 本文只描述**现状与设计权衡**，**不依赖具体行号**（行号随代码演进立即过期），请用**函数名 / 类名 + 语义**作索引（见附录 A）。界面截图见 `docs/interface.png`、`docs/screenshot-filter-anchor.png`。
 
 ---
 

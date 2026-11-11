@@ -330,8 +330,7 @@ DiskGuard/
 ├─ tools/
 │  └─ make_icon.py          # 图标生成脚本（几何绘制，仅构建期用）
 └─ docs/
-   ├─ screenshot-main.png           # 主界面
-   ├─ screenshot-minsize.png        # 最小窗口尺寸下的布局
+   ├─ interface.png                 # 主界面（README 首图）
    └─ screenshot-filter-anchor.png  # 筛选 + 按天锚点
 ```
 
