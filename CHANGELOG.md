@@ -3,6 +3,19 @@
 本文件记录 DiskGuard 的主要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 修复
+
+- **子树匹配误伤兄弟目录**：缓存命中（`touch`）与删除记录清理（`remove_subtree`）的
+  LIKE 前缀匹配未补路径分隔符，`C:\Program Files` 会连带命中 `C:\Program Files (x86)`
+  这类共享前缀的兄弟目录——删除时清空其历史与基准记录，缓存命中时写入伪历史点。
+  现统一走 `subtree_like()`（先补分隔符再转义通配）。
+- **盘根删除守卫失效**：`normpath("C:\")` 以反斜杠而非冒号结尾，
+  `len<=3 and endswith(":")` 永不命中，界面与 API 两处守卫形同虚设（此前仅靠
+  `SHFileOperationW` 自身拒绝兜底）。改用 `splitdrive` 判据 `is_protected_root()`，
+  盘根与 UNC 共享根一并拒绝。
+
 ## [1.0.0] - 2026-09-24
 
 首个公开版本，功能集已稳定。

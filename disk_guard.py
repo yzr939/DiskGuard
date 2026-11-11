@@ -621,6 +621,16 @@ def path_esc(p):
     return p.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def subtree_like(p):
+    """构造"p 的子孙"的 LIKE 模式串(精确匹配由 SQL 里的 path=? 负责)。
+
+    必须先补上路径分隔符再通配: 直接 p+"%" 会命中所有共享前缀的兄弟目录
+    (如 "Program Files" 命中 "Program Files (x86)"), 造成误删/误touch。
+    p 先补分隔符再转义, 盘根("C:\\" 自带反斜杠)与普通路径都正确。
+    """
+    return path_esc(p + "\\") + "%"
+
+
 def upsert_row(path, size, ts, sig, denied, partial, seq):
     """构造 folders 表 upsert 参数(16 元组), ts/size 重复出现供 hist 追加 [时间, 大小] 对。"""
     val = 0 if size is None else size
@@ -748,7 +758,7 @@ class Store:
         p = norm(path)
         t = ts or now_str()
         with self._lock:
-            self._conn.execute(_TOUCH_SUBTREE, (seq, t, t, p, path_esc(p) + "%"))
+            self._conn.execute(_TOUCH_SUBTREE, (seq, t, t, p, subtree_like(p)))
             self._conn.commit()
 
     @staticmethod
@@ -811,7 +821,7 @@ class Store:
         with self._lock:
             self._conn.execute(
                 "DELETE FROM folders WHERE path=? OR path LIKE ? ESCAPE '\\'",
-                (p, path_esc(p) + "%"))
+                (p, subtree_like(p)))
             self._conn.commit()
 
     def info(self):
@@ -1061,13 +1071,24 @@ FOF_SILENT = 0x0004
 FOF_NOERRORUI = 0x0400
 
 
+def is_protected_root(p):
+    """盘根/UNC 共享根的统一判据(删除守卫用, 两处调用共享这一份)。
+
+    不能用 len<=3 and endswith(":") 判盘根: normpath("C:\\") 返回 "C:\\",
+    以反斜杠而非冒号结尾, 该条件永不命中, 等于没拦。splitdrive 取设备名之后的
+    剩余部分: 盘根 "C:\\" -> "\\", "C:" -> "", UNC 根 "\\\\srv\\share" -> "",
+    一并拒绝。
+    """
+    return os.path.splitdrive(p)[1] in ("", "\\")
+
+
 def delete_to_recycle_bin(path):
     """把文件夹/文件移入回收站。返回 (ok, 说明)。"""
     path = os.path.abspath(path)
     npth = os.path.normpath(path)
     if not os.path.exists(npth):
         return False, "路径不存在"
-    if len(npth) <= 3 and npth.endswith(":"):
+    if is_protected_root(npth):
         return False, "不允许删除磁盘根目录"
     if not os.path.isdir(npth):
         return False, "目标不是文件夹"
@@ -2536,7 +2557,7 @@ class DiskGuardApp:
             self._set_status(f"目录不存在: {path}")
             return
         p = os.path.normpath(path)
-        if len(p) <= 3 and p.endswith(":"):
+        if is_protected_root(p):
             self._set_status("不允许删除磁盘根目录")
             return
         if not confirm_delete(self.root, p, format_size(row["size"])):
@@ -2815,6 +2836,20 @@ def _selftest_body():
     assert a not in [r["path"] for r in store.children(base)]
     assert not store.children(a)
 
+    # --- 子树匹配不误伤共享前缀的兄弟目录(LIKE 必须补路径分隔符再通配) ---
+    d1 = os.path.join(base, "delme"); d2 = os.path.join(base, "delme2")
+    store.upsert_many([upsert_row(d1, 10, now_str(), None, False, False, 0),
+                       upsert_row(os.path.join(d1, "kid"), 5, now_str(), None, False, False, 0),
+                       upsert_row(d2, 20, now_str(), None, False, False, 0)])
+    store.remove_subtree(d1)
+    kids = {r["path"]: r for r in store.children(base)}
+    assert d2 in kids, "兄弟目录 delme2 不得被 delme 连带删除"
+    assert len(kids[d2]["hist"]) == 1, kids[d2]["hist"]         # 历史点不被污染
+    store.touch(d1, 0, ts=now_str())
+    kids = {r["path"]: r for r in store.children(base)}
+    assert d2 in kids and len(kids[d2]["hist"]) == 1            # touch 同样不得波及兄弟
+    assert not store.children(d1)                               # delme 自身子树已清空
+
     # --- 回收站删除(仅对临时目录) ---
     victim = os.path.join(work, "victim"); os.makedirs(victim)
     with open(os.path.join(victim, "f.txt"), "wb") as f:
@@ -2824,6 +2859,12 @@ def _selftest_body():
     assert not os.path.exists(victim)
     ok2, _ = delete_to_recycle_bin("C:\\")
     assert not ok2                                              # 盘根拒绝
+    # 守卫判据本身必须成立: 此前 endswith(":") 在 normpath("C:\\") 上永不命中,
+    # 上面的断言只是碰巧被 SHFileOperationW 的拒绝兜住, 并没有测到守卫
+    assert is_protected_root("C:\\") and is_protected_root("C:")
+    assert is_protected_root("\\\\srv\\share")                  # UNC 共享根同样拒绝
+    assert not is_protected_root("C:\\Windows")
+    assert not is_protected_root(os.path.join(base, "alpha"))
 
     # --- 杂项 ---
     assert format_size(3 * 1024 * 1024) == "3.0 MB"
